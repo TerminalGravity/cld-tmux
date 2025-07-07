@@ -1,0 +1,389 @@
+#!/usr/bin/env zsh
+# cld - Claude tmux session manager v2
+# Enhanced with multiple sessions, renaming, and detailed info
+
+# Config
+PROJECTS_DIR="${CLD_PROJECTS_DIR:-$HOME/projects}"
+SESSION_PREFIX="claude"
+CLAUDE_CACHE_DIR="$HOME/.cache/claude-cli"
+
+# Colors
+R='\033[0;31m'  # Red
+G='\033[0;32m'  # Green
+B='\033[0;34m'  # Blue
+Y='\033[0;33m'  # Yellow
+C='\033[0;36m'  # Cyan
+M='\033[0;35m'  # Magenta
+D='\033[2m'     # Dim
+N='\033[0m'     # None
+
+# Simple status messages
+ok() { echo -e "${G}✓${N} $1"; }
+err() { echo -e "${R}✗${N} $1" >&2; }
+info() { echo -e "${B}→${N} $1"; }
+warn() { echo -e "${Y}⚠${N} $1"; }
+
+# Check requirements
+check_deps() {
+    command -v tmux &>/dev/null || { err "tmux not found"; return 1; }
+    command -v claude &>/dev/null || { err "claude not found"; return 1; }
+}
+
+# Get human readable time ago
+time_ago() {
+    local timestamp=$1
+    local now=$(date +%s)
+    local diff=$((now - timestamp))
+    
+    if [[ $diff -lt 60 ]]; then
+        echo "${diff}s ago"
+    elif [[ $diff -lt 3600 ]]; then
+        echo "$((diff / 60))m ago"
+    elif [[ $diff -lt 86400 ]]; then
+        echo "$((diff / 3600))h ago"
+    else
+        echo "$((diff / 86400))d ago"
+    fi
+}
+
+# Get session context size (estimate based on cache)
+get_context_size() {
+    local session="$1"
+    local project_path="$2"
+    local size=0
+    
+    # Check Claude cache directories
+    if [[ -n "$project_path" ]]; then
+        # Look for cache based on project path
+        local cache_name=${project_path//\//-}
+        local cache_paths=(
+            "$CLAUDE_CACHE_DIR/$cache_name"
+            "$HOME/.cache/claude-cli-nodejs/$cache_name"
+            "$HOME/.claude/projects/$cache_name"
+        )
+        
+        for cache_path in $cache_paths; do
+            if [[ -d "$cache_path" ]]; then
+                size=$(du -sh "$cache_path" 2>/dev/null | cut -f1)
+                break
+            fi
+        done
+    fi
+    
+    [[ -n "$size" ]] && echo "$size" || echo "—"
+}
+
+# Parse project path with session name support
+get_project_info() {
+    local input="$1"
+    local session_name="$2"
+    local name path
+    
+    if [[ -z "$input" ]]; then
+        # No input = current directory
+        path="$PWD"
+        name=${PWD:t}
+    elif [[ "$input" =~ ^https://github.com/([^/]+)/([^/]+) ]]; then
+        # GitHub URL
+        local repo=${match[2]%.git}
+        name="$repo"
+        path="$PROJECTS_DIR/$repo"
+        
+        if [[ ! -d "$path" ]]; then
+            info "Cloning $repo..."
+            mkdir -p "$PROJECTS_DIR"
+            git clone "$input" "$path" || return 1
+            ok "Cloned successfully"
+        fi
+    elif [[ -d "$input" ]]; then
+        # Existing directory
+        path=${input:A}  # zsh absolute path
+        name=${path:t}
+    elif [[ -d "$PROJECTS_DIR/$input" ]]; then
+        # Project name
+        path="$PROJECTS_DIR/$input"
+        name="$input"
+    else
+        # New project
+        path="$PROJECTS_DIR/$input"
+        name="$input"
+        mkdir -p "$path"
+    fi
+    
+    # Clean name for tmux
+    name=${name//[^a-zA-Z0-9-]/-}
+    
+    # Add session suffix if provided
+    if [[ -n "$session_name" ]]; then
+        name="${name}-${session_name}"
+    fi
+    
+    echo "$name|$path"
+}
+
+# Get detailed session info
+get_session_details() {
+    local session="$1"
+    local pid=$(tmux list-panes -t "$session:0.0" -F "#{pane_pid}" 2>/dev/null | head -1)
+    local dir=""
+    local activity=""
+    local windows=0
+    local panes=0
+    
+    # Get working directory
+    [[ -n "$pid" ]] && [[ -e "/proc/$pid/cwd" ]] && dir=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+    
+    # Get window/pane count
+    windows=$(tmux list-windows -t "$session" 2>/dev/null | wc -l)
+    panes=$(tmux list-panes -a -t "$session" 2>/dev/null | wc -l)
+    
+    # Get last activity
+    activity=$(tmux list-sessions -F "#{session_activity}" -f "#{==:#{session_name},$session}" 2>/dev/null)
+    
+    echo "$dir|$windows|$panes|$activity"
+}
+
+# List sessions with detailed info
+list_sessions() {
+    local filter="$1"
+    local sessions=$(tmux ls 2>/dev/null | grep "^$SESSION_PREFIX" || true)
+    
+    if [[ -z "$sessions" ]]; then
+        echo "No active sessions"
+        echo ""
+        echo "Start one:"
+        echo "  cld [project]"
+        echo "  cld [project] -n [name]  # Named session"
+        return
+    fi
+    
+    echo -e "${B}Active Claude Sessions${N}"
+    echo "────────────────────────────────────────────"
+    
+    while IFS=: read -r name rest; do
+        # Skip if filter doesn't match
+        [[ -n "$filter" ]] && [[ ! "$name" =~ "$filter" ]] && continue
+        
+        # Get details
+        IFS='|' read -r dir windows panes activity <<< "$(get_session_details "$name")"
+        
+        # Session name and status
+        echo -e "\n${G}●${N} ${M}$name${N}"
+        
+        # Working directory
+        if [[ -n "$dir" ]]; then
+            echo -e "  ${D}Path:${N} $dir"
+            
+            # Check if Claude project
+            [[ -d "$dir/.claude" ]] && echo -e "  ${D}Type:${N} ${C}Claude Project${N}"
+        fi
+        
+        # Stats
+        echo -ne "  ${D}Windows:${N} $windows"
+        echo -ne " ${D}│ Panes:${N} $panes"
+        
+        # Last activity
+        if [[ -n "$activity" ]]; then
+            echo -ne " ${D}│ Active:${N} $(time_ago $activity)"
+        fi
+        
+        # Context size
+        local size=$(get_context_size "$name" "$dir")
+        [[ "$size" != "—" ]] && echo -ne " ${D}│ Context:${N} $size"
+        
+        echo ""
+    done <<< "$sessions"
+    
+    echo -e "\n${D}Tip: Use 'cld -r <old> <new>' to rename sessions${N}"
+}
+
+# Start or attach session
+start_session() {
+    local name="$1"
+    local path="$2"
+    local windows="${3:-1}"
+    local session="$SESSION_PREFIX-$name"
+    
+    if tmux has-session -t "$session" 2>/dev/null; then
+        info "Attaching to $session"
+        
+        # Show current stats
+        IFS='|' read -r dir win panes activity <<< "$(get_session_details "$session")"
+        [[ -n "$dir" ]] && echo -e "  ${D}$dir${N}"
+        echo -e "  ${D}$win windows, $panes panes${N}"
+        
+        tmux attach -t "$session"
+    else
+        info "Creating $session"
+        echo -e "  ${C}$path${N}"
+        
+        # Create session
+        tmux new-session -d -s "$session" -c "$path" claude
+        
+        # Add more windows if requested
+        for ((i=2; i<=windows; i++)); do
+            tmux new-window -t "$session" -c "$path" claude
+        done
+        
+        ok "Session created"
+        tmux attach -t "$session"
+    fi
+}
+
+# Kill session
+kill_session() {
+    local name="$1"
+    local session="$SESSION_PREFIX-$name"
+    
+    # Try with prefix first
+    if tmux kill-session -t "$session" 2>/dev/null; then
+        ok "Killed $session"
+    # Try exact name
+    elif tmux kill-session -t "$name" 2>/dev/null; then
+        ok "Killed $name"
+    else
+        err "Session not found: $name"
+        return 1
+    fi
+}
+
+# Rename session
+rename_session() {
+    local old="$1"
+    local new="$2"
+    
+    # Add prefix if needed
+    [[ ! "$old" =~ ^$SESSION_PREFIX ]] && old="$SESSION_PREFIX-$old"
+    [[ ! "$new" =~ ^$SESSION_PREFIX ]] && new="$SESSION_PREFIX-$new"
+    
+    if tmux rename-session -t "$old" "$new" 2>/dev/null; then
+        ok "Renamed $old → $new"
+    else
+        err "Failed to rename session"
+        return 1
+    fi
+}
+
+# Interactive session picker
+pick_session() {
+    local sessions=($(tmux ls -F "#{session_name}" 2>/dev/null | grep "^$SESSION_PREFIX"))
+    
+    [[ ${#sessions[@]} -eq 0 ]] && { warn "No sessions found"; return 1; }
+    
+    echo -e "${B}Select a session:${N}"
+    for i in "${!sessions[@]}"; do
+        local s="${sessions[$i]}"
+        IFS='|' read -r dir windows panes activity <<< "$(get_session_details "$s")"
+        echo -e "${G}$((i+1)))${N} $s ${D}($windows windows)${N}"
+        [[ -n "$dir" ]] && echo -e "   ${D}$dir${N}"
+    done
+    
+    echo -n "Choice: "
+    read choice
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice > 0 && choice <= ${#sessions[@]})); then
+        tmux attach -t "${sessions[$((choice-1))]}"
+    else
+        err "Invalid choice"
+        return 1
+    fi
+}
+
+# Main
+main() {
+    check_deps || return 1
+    
+    local project=""
+    local session_name=""
+    local windows=1
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -l|--list|ls)
+                list_sessions "$2"
+                return
+                ;;
+            -k|--kill|kill)
+                [[ -z "$2" ]] && { err "Usage: cld -k <name>"; return 1; }
+                kill_session "$2"
+                return
+                ;;
+            -r|--rename)
+                [[ -z "$2" || -z "$3" ]] && { err "Usage: cld -r <old> <new>"; return 1; }
+                rename_session "$2" "$3"
+                return
+                ;;
+            -s|--select)
+                pick_session
+                return
+                ;;
+            -n|--name)
+                session_name="$2"
+                shift 2
+                ;;
+            -w|--windows)
+                windows="$2"
+                shift 2
+                ;;
+            -h|--help|help)
+                cat << EOF
+cld - Claude tmux session manager v2
+
+USAGE:
+    cld [project]              Start/attach session
+    cld [project] -n [name]    Named session for project
+    cld -l [filter]            List sessions (with details)
+    cld -k <name>              Kill session
+    cld -r <old> <new>         Rename session
+    cld -s                     Select session interactively
+    cld -h                     Show help
+
+OPTIONS:
+    -n, --name NAME      Create named session (e.g., "feature-x")
+    -w, --windows N      Create N windows (default: 1)
+
+PROJECT can be:
+    • Path to directory
+    • GitHub URL 
+    • Project name
+    • Empty (current dir)
+
+EXAMPLES:
+    cld                              # Current directory
+    cld myapp                        # Project in ~/projects/
+    cld myapp -n testing             # Named session "claude-myapp-testing"
+    cld ~/work/api -n bugfix         # Multiple sessions for same project
+    cld -l                           # List with activity & context size
+    cld -r claude-api claude-api-v2  # Rename session
+
+ENHANCED FEATURES:
+    • Multiple named sessions per project
+    • Shows last activity timestamp
+    • Shows context size (when available)
+    • Session renaming
+    • Detailed session information
+
+TIPS:
+    • Detach: Ctrl+b d
+    • Switch windows: Ctrl+b [0-9]
+    • Sessions persist across SSH
+EOF
+                ;;
+            -*)
+                err "Unknown option: $1"
+                return 1
+                ;;
+            *)
+                project="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Default action: start/attach
+    local info=$(get_project_info "$project" "$session_name") || return 1
+    IFS='|' read -r name path <<< "$info"
+    start_session "$name" "$path" "$windows"
+}
+
+main "$@"

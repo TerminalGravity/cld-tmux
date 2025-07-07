@@ -1,0 +1,66 @@
+#compdef cld
+# ZSH completion for cld
+
+_cld() {
+    local context state line
+    
+    _arguments -C \
+        '1: :->command' \
+        '2: :->args'
+    
+    case $state in
+        command)
+            local -a options projects
+            options=(
+                '-l:List active sessions'
+                '-k:Kill a session'
+                '-r:Rename session'
+                '-s:Select session interactively'
+                '-n:Named session'
+                '-w:Number of windows'
+                '-h:Show help'
+            )
+            
+            # Get project directories
+            if [[ -d "${CLD_PROJECTS_DIR:-$HOME/projects}" ]]; then
+                projects=(${CLD_PROJECTS_DIR:-$HOME/projects}/*(/:t))
+            fi
+            
+            # Get current tmux sessions
+            local sessions=(${$(tmux ls 2>/dev/null | grep "^claude-" | cut -d: -f1 | sed 's/^claude-//')})
+            
+            _describe -t options 'option' options
+            _describe -t projects 'project' projects
+            _describe -t sessions 'session' sessions
+            _files -/
+            ;;
+            
+        args)
+            case $line[1] in
+                -k|--kill)
+                    # Complete with session names
+                    local sessions=(${$(tmux ls 2>/dev/null | grep "^claude-" | cut -d: -f1 | sed 's/^claude-//')})
+                    _describe -t sessions 'session' sessions
+                    ;;
+                -n|--name)
+                    _message 'session name'
+                    ;;
+                -w|--windows)
+                    _message 'number of windows'
+                    ;;
+                -r|--rename)
+                    if [[ ${#words} -eq 2 ]]; then
+                        # First argument: old name
+                        local sessions=(${$(tmux ls 2>/dev/null | grep "^claude-" | cut -d: -f1)})
+                        _describe -t sessions 'old session name' sessions
+                    else
+                        # Second argument: new name
+                        _message 'new session name'
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_cld "$@"
