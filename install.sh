@@ -43,7 +43,7 @@ mkdir -p "$HOME/projects"
 
 # Install cld script
 echo -e "\n${BLUE}Installing cld...${NC}"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cp "$SCRIPT_DIR/cld" "$HOME/scripts/cld"
 chmod +x "$HOME/scripts/cld"
 echo -e "${GREEN}✓ Installed to ~/scripts/cld${NC}"
